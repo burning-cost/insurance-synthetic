@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "insurance-synthetic"
+version = "0.1.0"
+description = "Vine copula synthetic insurance portfolio data generator"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Burning Cost", email = "pricing.frontier@gmail.com" }
+]
+keywords = [
+    "actuarial",
+    "synthetic-data",
+    "vine-copula",
+    "insurance",
+    "pricing",
+    "portfolio",
+    "motor",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Office/Business :: Financial",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.21",
+    "polars>=0.20",
+    "scipy>=1.10",
+    "pyvinecopulib>=0.6",
+]
+
+[project.optional-dependencies]
+fidelity = [
+    "catboost>=1.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.urls]
+Repository = "https://github.com/burning-cost/insurance-synthetic"
+Issues = "https://github.com/burning-cost/insurance-synthetic/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/insurance_synthetic"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["src/insurance_synthetic"]
