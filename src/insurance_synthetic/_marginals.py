@@ -296,32 +296,36 @@ def fit_marginal(
     if len(arr) == 0:
         raise ValueError(f"Column '{col_name}' has no non-null values after dropping nulls.")
 
+    _DISCRETE_FAMILY_NAMES = {"poisson", "nbinom"}
+
     # --- Discrete handling ---
-    if is_discrete or (data.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                                       pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
-                       and arr.min() >= 0 and family == "auto"):
-        if family != "auto":
-            family_map = {"poisson": stats.poisson, "nbinom": stats.nbinom}
-            dist = family_map.get(family)
-            if dist is not None:
-                if dist == stats.poisson:
-                    mu = float(np.mean(arr))
-                    params: tuple = (max(mu, 1e-6),)
-                else:
-                    mean_ = float(np.mean(arr))
-                    var_ = float(np.var(arr))
-                    n = mean_ ** 2 / max(var_ - mean_, 1e-6)
-                    p = mean_ / max(var_, 1e-6)
-                    params = (max(n, 0.1), np.clip(p, 1e-6, 1 - 1e-6))
-                ll = float(np.sum(dist.logpmf(arr.astype(int), *params)))
-                return FittedMarginal(
-                    col_name=col_name,
-                    kind="discrete",
-                    dist=dist,
-                    params=params,
-                    aic=_aic(ll, len(params)),
-                    clip_lower=0.0,
-                )
+    # Trigger discrete path if: explicitly requested, integer dtype with auto
+    # family, or the caller specified a discrete family name.
+    _is_int_dtype = data.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                                    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)
+    if is_discrete or family in _DISCRETE_FAMILY_NAMES or (
+            _is_int_dtype and arr.min() >= 0 and family == "auto"):
+        if family in _DISCRETE_FAMILY_NAMES:
+            discrete_map = {"poisson": stats.poisson, "nbinom": stats.nbinom}
+            dist = discrete_map[family]
+            if dist == stats.poisson:
+                mu = float(np.mean(arr))
+                params: tuple = (max(mu, 1e-6),)
+            else:
+                mean_ = float(np.mean(arr))
+                var_ = float(np.var(arr))
+                nb_n = mean_ ** 2 / max(var_ - mean_, 1e-6)
+                nb_p = mean_ / max(var_, 1e-6)
+                params = (max(nb_n, 0.1), np.clip(nb_p, 1e-6, 1 - 1e-6))
+            ll = float(np.sum(dist.logpmf(arr.astype(int), *params)))
+            return FittedMarginal(
+                col_name=col_name,
+                kind="discrete",
+                dist=dist,
+                params=params,
+                aic=_aic(ll, len(params)),
+                clip_lower=0.0,
+            )
 
         dist, params, aic = _fit_discrete(arr)
         return FittedMarginal(
@@ -344,7 +348,12 @@ def fit_marginal(
         }
         dist_cls = family_map.get(family)
         if dist_cls is None:
-            raise ValueError(f"Unknown family '{family}'. Use 'auto' or one of: {list(family_map)}")
+            all_families = list(family_map) + ["poisson", "nbinom"]
+            raise ValueError(
+                f"Unknown family '{family}'. Use 'auto' or one of: {all_families}. "
+                "For discrete (Poisson/NegBin), pass an integer Series or use "
+                "is_discrete=True."
+            )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             params = dist_cls.fit(arr, method="MLE")

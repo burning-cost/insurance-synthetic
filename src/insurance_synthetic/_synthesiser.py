@@ -222,14 +222,20 @@ class InsuranceSynthesizer:
 
         for j, col in enumerate(df.columns):
             marginal = self._fitted_marginals[col]
-            arr = df[col].to_numpy().astype(float)
+
+            if marginal.kind == "categorical":
+                # Convert string/category values to integer indices
+                cat_map = {v: i for i, v in enumerate(marginal.categories)}
+                raw_vals = df[col].to_list()
+                arr = np.array([cat_map.get(v, 0) for v in raw_vals], dtype=float)
+            else:
+                arr = df[col].to_numpy().astype(float)
 
             raw_u = marginal.cdf(arr)
 
             # Discrete / categorical jitter to avoid ties at CDF steps
             if marginal.kind in ("discrete", "categorical"):
-                jitter = self._rng.uniform(0, 1.0 / max(n, 1), size=n)
-                # Step back one increment to get the pre-jump value, then add jitter
+                # Step back one CDF increment, then add uniform jitter across the step
                 prev_u = _discrete_prev_cdf(marginal, arr)
                 raw_u = prev_u + (raw_u - prev_u) * self._rng.uniform(0, 1, size=n)
 
@@ -287,9 +293,9 @@ class InsuranceSynthesizer:
             exposure = rows[self._exposure_col].to_numpy()
             lambdas = self._frequency_rate * exposure
             counts = self._rng.poisson(lambdas)
-            max_count = int(self._fitted_marginals[self._frequency_col].clip_upper)
-            if max_count < 1e9:
-                counts = np.clip(counts, 0, max_count)
+            clip_upper = self._fitted_marginals[self._frequency_col].clip_upper
+            if np.isfinite(clip_upper):
+                counts = np.clip(counts, 0, int(clip_upper))
             rows = rows.with_columns(
                 pl.Series(name=self._frequency_col, values=counts.astype(int))
             )
