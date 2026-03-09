@@ -31,12 +31,7 @@ try:
     _VINE_AVAILABLE = True
 except ImportError:
     _VINE_AVAILABLE = False
-    warnings.warn(
-        "pyvinecopulib is not installed. Falling back to Gaussian copula. "
-        "Install pyvinecopulib for full vine copula support including tail dependence.",
-        ImportWarning,
-        stacklevel=2,
-    )
+    pv = None  # type: ignore
 
 
 class VineCopulaModel:
@@ -98,6 +93,14 @@ class VineCopulaModel:
         if _VINE_AVAILABLE and not self._using_fallback:
             self._fit_vine(u)
         else:
+            if not self._using_fallback:
+                warnings.warn(
+                    "pyvinecopulib is not installed. Falling back to Gaussian copula. "
+                    "Install insurance-synthetic[vine] for full vine copula support ",
+                    ImportWarning,
+                    stacklevel=3,
+                )
+                self._using_fallback = True
             self._fit_gaussian(u)
 
         self._fitted = True
