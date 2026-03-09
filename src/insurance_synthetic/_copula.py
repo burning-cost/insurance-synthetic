@@ -109,7 +109,15 @@ class VineCopulaModel:
             trunc_lvl=self.trunc_lvl if self.trunc_lvl is not None else 1000,
             num_threads=self.n_threads,
         )
-        self._vine = pv.Vinecop(data=u, controls=controls)
+        # pyvinecopulib >=0.6 changed the constructor: Vinecop(d) then .fit()
+        # Older versions accepted Vinecop(data=u, controls=controls)
+        try:
+            # New API (>=0.6)
+            self._vine = pv.Vinecop(u.shape[1])
+            self._vine.fit(data=u, controls=controls)
+        except TypeError:
+            # Old API fallback
+            self._vine = pv.Vinecop(data=u, controls=controls)
 
     def _fit_gaussian(self, u: np.ndarray) -> None:
         """
