@@ -1,5 +1,8 @@
 # insurance-synthetic
+
 [![Tests](https://github.com/burning-cost/insurance-synthetic/actions/workflows/tests.yml/badge.svg)](https://github.com/burning-cost/insurance-synthetic/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/insurance-synthetic)](https://pypi.org/project/insurance-synthetic/)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
 Generate synthetic insurance portfolio data using vine copulas.
 
@@ -171,6 +174,21 @@ Tests run on Databricks — the package targets environments with pyvinecopulib 
 # On a machine with the dependencies installed:
 pytest tests/ -v
 ```
+
+## Read more
+
+[Your Synthetic Data Doesn't Know What Exposure Is](https://burning-cost.github.io/2026/03/08/insurance-synthetic.html) — why SDV and CTGAN produce portfolios that look right column by column and break the moment you run a pricing model on them.
+
+## Related libraries
+
+| Library | Why it's relevant |
+|---------|------------------|
+| [insurance-datasets](https://github.com/burning-cost/insurance-datasets) | Fixed synthetic datasets with published DGPs — use when you need reproducible benchmarks rather than portfolio-fitted synthesis |
+| [insurance-cv](https://github.com/burning-cost/insurance-cv) | Walk-forward cross-validation — synthetic data can be used to stress-test CV strategies before applying to real books |
+| [insurance-interactions](https://github.com/burning-cost/insurance-interactions) | GLM interaction detection — synthetic portfolios with known interaction structure are useful for validating the CANN pipeline |
+| [insurance-fairness](https://github.com/burning-cost/insurance-fairness) | Proxy discrimination auditing — generate synthetic portfolios to test fairness tooling without exposing real policyholder data |
+
+[All Burning Cost libraries →](https://burning-cost.github.io)
 
 ## Licence
 
