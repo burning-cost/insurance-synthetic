@@ -1,4 +1,5 @@
 # insurance-synthetic
+[![Tests](https://github.com/burning-cost/insurance-synthetic/actions/workflows/tests.yml/badge.svg)](https://github.com/burning-cost/insurance-synthetic/actions/workflows/tests.yml)
 
 Generate synthetic insurance portfolio data using vine copulas.
 
