@@ -43,10 +43,31 @@ Requires Python 3.10+.
 ## Quick start
 
 ```python
+import numpy as np
 import polars as pl
 from insurance_synthetic import InsuranceSynthesizer, SyntheticFidelityReport
 
-# Fit on your real portfolio
+# Seed data: either load from insurance-datasets or generate minimal inline data.
+#
+# Option A — use the published synthetic seed portfolio (recommended):
+#   uv add insurance-datasets
+#   from insurance_datasets import load_motor
+#   real_df = load_motor()  # 50,000-row UK motor portfolio with known DGP
+#
+# Option B — minimal inline portfolio for a quick demo:
+rng = np.random.default_rng(42)
+n = 5_000
+real_df = pl.DataFrame({
+    'driver_age':    rng.integers(17, 75, size=n).tolist(),
+    'vehicle_group': rng.integers(1, 20, size=n).tolist(),
+    'ncd_years':     rng.integers(0, 15, size=n).tolist(),
+    'region':        rng.choice(['London', 'South East', 'North West', 'Scotland'], size=n).tolist(),
+    'exposure':      rng.uniform(0.1, 1.0, size=n).tolist(),
+    'claim_count':   rng.poisson(0.07, size=n).tolist(),
+    'claim_amount':  (rng.gamma(2.0, scale=1500, size=n) * (rng.poisson(0.07, size=n) > 0)).tolist(),
+})
+
+# Fit on your portfolio (real or synthetic seed above)
 synth = InsuranceSynthesizer(random_state=42)
 synth.fit(
     real_df,
