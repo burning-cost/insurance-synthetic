@@ -179,6 +179,16 @@ pytest tests/ -v
 
 [Your Synthetic Data Doesn't Know What Exposure Is](https://burning-cost.github.io/2026/03/08/insurance-synthetic.html) — why SDV and CTGAN produce portfolios that look right column by column and break the moment you run a pricing model on them.
 
+## Capabilities
+
+The notebook at `notebooks/01_insurance_synthetic_demo.py` fits an `InsuranceSynthesizer` on a 5,000-row UK motor seed portfolio and generates 50,000 synthetic policies. It demonstrates:
+
+- **Marginal fidelity**: KS statistics for most columns land below 0.05, confirming that the per-column distributions are closely reproduced by the vine copula.
+- **Dependency preservation**: Spearman rank correlation between NCD years and claim count is negative in both real and synthetic data, and matches in magnitude — the vine captures this structural relationship rather than treating columns as independent.
+- **Annualised frequency stability**: The claim frequency per policy year in the synthetic portfolio matches the seed within a few percent, confirming the exposure-aware generation step works correctly.
+- **Tail risk**: TVaR ratio at the 99th percentile stays near 1.0, indicating that the tail of the claim count distribution is preserved — important for catastrophe loading and reserving applications.
+- **Mixed types handled**: The same synthesiser handles continuous (mileage, severity), discrete (claim count, NCD), and categorical (region, cover type) columns within a single vine copula fit.
+
 ## Related libraries
 
 | Library | Why it's relevant |
