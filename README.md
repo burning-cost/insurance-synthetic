@@ -221,6 +221,14 @@ The notebook at `notebooks/01_insurance_synthetic_demo.py` fits an `InsuranceSyn
 
 [All Burning Cost libraries →](https://burning-cost.github.io)
 
+
+## Related Libraries
+
+| Library | What it does |
+|---------|-------------|
+| [insurance-datasets](https://github.com/burning-cost/insurance-datasets) | Fixed synthetic datasets with published DGPs — use when you need reproducible benchmarks rather than portfolio-fitted synthesis |
+| [insurance-fairness](https://github.com/burning-cost/insurance-fairness) | Proxy discrimination auditing — generate synthetic portfolios with known proxy structure to test the audit pipeline without exposing real data |
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
