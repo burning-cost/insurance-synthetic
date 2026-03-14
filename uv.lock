@@ -442,7 +442,6 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "polars" },
-    { name = "pyvinecopulib" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
@@ -455,18 +454,21 @@ dev = [
 fidelity = [
     { name = "catboost" },
 ]
+vine = [
+    { name = "pyvinecopulib" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "catboost", marker = "extra == 'fidelity'", specifier = ">=1.0" },
     { name = "numpy", specifier = ">=1.21" },
-    { name = "polars", specifier = ">=0.20" },
+    { name = "polars", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "pyvinecopulib", specifier = ">=0.6" },
+    { name = "pyvinecopulib", marker = "extra == 'vine'", specifier = ">=0.6" },
     { name = "scipy", specifier = ">=1.10" },
 ]
-provides-extras = ["fidelity", "dev"]
+provides-extras = ["vine", "fidelity", "dev"]
 
 [[package]]
 name = "kiwisolver"
