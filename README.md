@@ -210,6 +210,11 @@ The notebook at `notebooks/01_insurance_synthetic_demo.py` fits an `InsuranceSyn
 - **Tail risk**: TVaR ratio at the 99th percentile stays near 1.0, indicating that the tail of the claim count distribution is preserved — important for catastrophe loading and reserving applications.
 - **Mixed types handled**: The same synthesiser handles continuous (mileage, severity), discrete (claim count, NCD), and categorical (region, cover type) columns within a single vine copula fit.
 
+
+## Databricks Notebook
+
+A ready-to-run Databricks notebook benchmarking this library against standard approaches is available in [burning-cost-examples](https://github.com/burning-cost/burning-cost-examples/blob/main/notebooks/synthetic_portfolio_generation.py).
+
 ## Related libraries
 
 | Library | Why it's relevant |
