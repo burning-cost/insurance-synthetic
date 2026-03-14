@@ -196,6 +196,24 @@ Tests run on Databricks — the package targets environments with pyvinecopulib 
 pytest tests/ -v
 ```
 
+## Performance
+
+Benchmarked against **naive independent sampling** (each column drawn from its empirical marginal, correlations ignored) on a 10,000-policy UK motor seed portfolio. The synthesiser generates 50,000 synthetic policies; `SyntheticFidelityReport` quantifies the difference. Full methodology in `notebooks/synthetic_portfolio_generation.py`.
+
+Both methods preserve marginal distributions by construction — that is not the test. The test is whether the dependence structure survives. Naive sampling produces physically impossible combinations (19-year-olds with 20 years of NCD) and destroys all pairwise correlations. Any GLM or GBM trained on that data will learn the wrong relativities.
+
+| Metric | Vine copula | Naive independent | Notes |
+|--------|-------------|-------------------|-------|
+| KS statistic (per column, median) | < 0.05 | < 0.05 | Both preserve marginals; KS alone is not sufficient |
+| Spearman Frobenius norm | < 1.0 | ~3–5 | Lower = better dependence preservation |
+| Rho(NCD, claims) | matches seed | ~0.00 | Vine recovers the negative correlation; naive destroys it |
+| Rho(driver_age, NCD) | matches seed | ~0.00 | Vine preserves the physical age/NCD bound |
+| TVaR ratio @ 99th pct (claims) | 0.90–1.10 | varies | Vine stays near 1.0; naive has no dependence signal |
+| Annualised frequency error | < 2% | < 2% | Both use the same Poisson(λ × exposure) step |
+| Tail co-occurrence (veh_grp × claims, 90th pct) | matches seed | ~1% (independence) | Vine captures the high-risk cluster; naive misses it |
+
+The Frobenius norm and tail co-occurrence are the decisive metrics. A naive baseline achieves zero correlation between columns, so any off-diagonal Spearman correlation in the seed portfolio appears as a large Frobenius error. The vine copula brings this down to near-zero because it fits a bivariate copula family to each pair — including asymmetric families (Clayton, Gumbel) that capture the fact that extreme risks cluster in the tail.
+
 ## Read more
 
 [Your Synthetic Data Doesn't Know What Exposure Is](https://burning-cost.github.io/2026/03/08/insurance-synthetic.html) — why SDV and CTGAN produce portfolios that look right column by column and break the moment you run a pricing model on them.
@@ -225,14 +243,6 @@ A ready-to-run Databricks notebook benchmarking this library against standard ap
 | [insurance-fairness](https://github.com/burning-cost/insurance-fairness) | Proxy discrimination auditing — generate synthetic portfolios to test fairness tooling without exposing real policyholder data |
 
 [All Burning Cost libraries →](https://burning-cost.github.io)
-
-
-## Related Libraries
-
-| Library | What it does |
-|---------|-------------|
-| [insurance-datasets](https://github.com/burning-cost/insurance-datasets) | Fixed synthetic datasets with published DGPs — use when you need reproducible benchmarks rather than portfolio-fitted synthesis |
-| [insurance-fairness](https://github.com/burning-cost/insurance-fairness) | Proxy discrimination auditing — generate synthetic portfolios with known proxy structure to test the audit pipeline without exposing real data |
 
 ## Licence
 
