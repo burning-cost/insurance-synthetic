@@ -19,6 +19,8 @@ keywords = [
     "pricing",
     "portfolio",
     "motor",
+    "UK",
+    "personal lines",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -54,6 +56,8 @@ dev = [
 [project.urls]
 Repository = "https://github.com/burning-cost/insurance-synthetic"
 Issues = "https://github.com/burning-cost/insurance-synthetic/issues"
+Homepage = "https://github.com/burning-cost/insurance-synthetic"
+Documentation = "https://github.com/burning-cost/insurance-synthetic#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/insurance_synthetic"]
