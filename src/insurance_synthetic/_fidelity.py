@@ -150,7 +150,9 @@ class SyntheticFidelityReport:
         - spearman_real: Spearman correlation in the real data
         - spearman_synthetic: Spearman correlation in the synthetic data
         - delta: absolute difference
-        Also prints the Frobenius norm distance between the two matrices.
+        - frobenius_norm: Frobenius norm of the correlation matrix difference,
+          normalised by the number of columns d so it is comparable across
+          different-width datasets.
         """
         numeric_cols = [
             c for c in self.real_df.columns
@@ -183,7 +185,10 @@ class SyntheticFidelityReport:
                         "delta": float(abs(r_corr - s_corr)),
                     })
 
-        frobenius = float(np.linalg.norm(real_mat - synth_mat, "fro"))
+        # Frobenius norm normalised by d so it's comparable across datasets
+        # with different numbers of columns.
+        d = max(n_cols, 1)
+        frobenius = float(np.linalg.norm(real_mat - synth_mat, "fro")) / d
         result = pl.DataFrame(rows).sort("delta", descending=True)
 
         # Attach the Frobenius norm as metadata via a column constant
@@ -281,16 +286,23 @@ class SyntheticFidelityReport:
         Train-on-Synthetic, Test-on-Real (TSTR) Gini gap.
 
         Fits a CatBoost regressor on synthetic data, a second on a real
-        training set, then evaluates both on the real holdout. The Gini gap
-        is real_gini - synthetic_gini. Values near 0 mean the synthetic model
-        is as predictive as the real one.
+        training set (same 80/20 split), then evaluates both on the real
+        holdout. The Gini gap is real_gini - synthetic_gini. Values near 0
+        mean the synthetic model is as predictive as the real one.
+
+        Both models are trained on the same fraction of rows (1 - test_fraction)
+        so the comparison is fair. The real model uses the real training split;
+        the synthetic model uses all of synthetic_df (same size by convention
+        or truncated to match).
 
         Requires catboost to be installed (`pip install insurance-synthetic[fidelity]`).
 
         Parameters
         ----------
         test_fraction : float
-            Fraction of the real data held out for evaluation.
+            Fraction of the real data held out for evaluation. The real model
+            trains on (1 - test_fraction) of the real data. The synthetic model
+            trains on the same number of synthetic rows.
         catboost_iterations : int
             Number of CatBoost boosting rounds. Keep low for a quick check.
         random_state : int
@@ -329,10 +341,15 @@ class SyntheticFidelityReport:
         real_train = self.real_df[train_idx.tolist()]
         real_test = self.real_df[test_idx.tolist()]
 
+        # Use the same number of training rows for both models so the
+        # comparison is apples-to-apples. Truncate synthetic if it is larger.
+        n_train = len(real_train)
+        synth_train = self.synthetic_df[:n_train]
+
         x_real_train = real_train.select(feature_cols).to_pandas()
         y_real_train = real_train[self.target_col].to_numpy()
-        x_synth_train = self.synthetic_df.select(feature_cols).to_pandas()
-        y_synth_train = self.synthetic_df[self.target_col].to_numpy()
+        x_synth_train = synth_train.select(feature_cols).to_pandas()
+        y_synth_train = synth_train[self.target_col].to_numpy()
         x_test = real_test.select(feature_cols).to_pandas()
         y_test = real_test[self.target_col].to_numpy()
 
@@ -409,7 +426,7 @@ class SyntheticFidelityReport:
         try:
             corr = self.correlation_report()
             frob = float(corr["frobenius_norm"][0])
-            lines.append(f"Frobenius norm distance between Spearman correlation matrices: **{frob:.4f}**")
+            lines.append(f"Frobenius norm distance (normalised by d): **{frob:.4f}**")
             lines.append("")
             lines.append("Top pairs by absolute correlation difference:")
             lines.append("")
@@ -446,9 +463,15 @@ class SyntheticFidelityReport:
 # ---------------------------------------------------------------------------
 
 def _tvar(values: np.ndarray, percentile: float) -> float:
-    """Tail Value at Risk (CVaR) at the given percentile."""
+    """
+    Tail Value at Risk (CVaR) at the given percentile.
+
+    Standard actuarial definition: E[X | X > q_p] using strict inequality.
+    This ensures we are averaging only the values strictly beyond the VaR
+    threshold, not including the threshold itself.
+    """
     threshold = np.quantile(values, percentile)
-    tail = values[values >= threshold]
+    tail = values[values > threshold]
     if len(tail) == 0:
         return float(threshold)
     return float(np.mean(tail))
@@ -458,7 +481,14 @@ def _gini(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
     Normalised Gini coefficient (2 * AUC - 1) for regression.
 
-    Used as the standard insurance pricing discrimination metric.
+    The standard insurance pricing discrimination metric. The formula
+    computes twice the area between the model Lorenz curve and the diagonal:
+
+        Gini = 2 * sum(cumsum_y) / (n * sum_y) - (n+1)/n
+
+    which is approximately 2*AUC - 1 for large n. The factor of 2 is required
+    to scale the concentration statistic into the standard [-1, 1] range.
+
     Higher is better (more discriminating model).
     """
     n = len(y_true)

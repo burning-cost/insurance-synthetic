@@ -4,17 +4,23 @@ InsuranceSynthesizer: the main entry point for synthetic portfolio generation.
 The workflow is:
     1. fit() — fit a marginal distribution per column, then a vine copula
                on the probability-integral-transformed (PIT) data.
-    2. generate() — sample from the vine copula, invert through marginals,
-                    regenerate frequency columns using exposure offset.
+    2. generate() — sample from the vine copula, invert through marginals.
     3. summary() — print fitted marginals and copula structure.
 
-Exposure handling deserves a note. The exposure column is not modelled
-independently — it is fitted as a marginal and reproduced by the copula
-like any other column. But the frequency column is *conditional* on exposure:
-we draw from Poisson(lambda * exposure) where lambda is the fitted rate,
-not simply invert the frequency marginal. This preserves the frequency/
-exposure relationship that actuaries depend on (e.g., annualised claim rate
-should be stable regardless of how we slice the portfolio).
+Exposure and frequency handling:
+
+The copula models the joint distribution of all columns, including the
+frequency column and the exposure column. In generate(), we use the
+copula-sampled frequency directly rather than redrawing from a Poisson
+with a single global lambda. This preserves the copula-learned dependence
+between claim count and the rating factors (driver age, NCD years, vehicle
+group, etc.) — which is the whole reason we are using a copula in the first
+place.
+
+If the synthetic exposure differs from the original portfolio's average
+exposure, the frequency is scaled by the exposure ratio (synthetic_exposure /
+mean_real_exposure) to keep the implied claim rate consistent. This is a light
+adjustment — the dependence structure is always driven by the copula.
 """
 
 from __future__ import annotations
@@ -100,6 +106,7 @@ class InsuranceSynthesizer:
         self._frequency_col: Optional[str] = None
         self._severity_col: Optional[str] = None
         self._frequency_rate: Optional[float] = None  # lambda = claims / exposure
+        self._mean_exposure: Optional[float] = None   # mean exposure in training data
         self._categorical_cols: set[str] = set()
         self._is_fitted: bool = False
 
@@ -129,8 +136,8 @@ class InsuranceSynthesizer:
             in df, exposure is assumed to be 1.0 for all rows.
         frequency_col : str
             Name of the claim count column. If present, its marginal is fitted
-            but generation uses Poisson(lambda * exposure) to preserve the
-            exposure/frequency relationship.
+            and the copula learns its dependence with other columns. Generation
+            uses the copula-sampled frequency directly, preserving dependence.
         severity_col : str, optional
             Name of the claim amount column. Fitted as a continuous marginal.
             Zero-inflated (most policies have no claims) — the zero mass is
@@ -187,11 +194,12 @@ class InsuranceSynthesizer:
             )
             self._fitted_marginals[col] = marginal
 
-        # Compute frequency rate: overall lambda = total_claims / total_exposure
+        # Compute frequency rate and mean exposure for exposure-scaling at generation time
         if self._frequency_col is not None:
             total_claims = float(df[self._frequency_col].sum())
             total_exposure = float(df[self._exposure_col].sum())
             self._frequency_rate = total_claims / max(total_exposure, 1e-9)
+            self._mean_exposure = float(df[self._exposure_col].mean())
 
         # PIT transform all columns to uniform [0,1]
         u_matrix = self._pit_transform(df)
@@ -213,8 +221,12 @@ class InsuranceSynthesizer:
 
         Returns an (n, d) array of uniform [0,1] values. Categoricals are
         mapped through their empirical CDF. Ties in discrete columns are
-        resolved by adding uniform jitter in [0, 1/n] — the standard approach
-        for fitting copulas to discrete data.
+        resolved by adding uniform jitter in [prev_u, u] — the standard
+        approach for fitting copulas to discrete data.
+
+        For zero counts (the common case in motor — 85%+ of policies have
+        zero claims), prev_u is set to 0.0 rather than CDF(0 - 1) = CDF(-1),
+        which would be CDF(0) due to clipping and collapse to a point mass.
         """
         n = len(df)
         d = len(df.columns)
@@ -235,7 +247,11 @@ class InsuranceSynthesizer:
 
             # Discrete / categorical jitter to avoid ties at CDF steps
             if marginal.kind in ("discrete", "categorical"):
-                # Step back one CDF increment, then add uniform jitter across the step
+                # Step back one CDF increment, then add uniform jitter across the step.
+                # For arr == 0 (or any arr at the left boundary), prev_u = 0.0 rather
+                # than CDF(arr - 1) — because for arr=0, CDF(0-1) clips to CDF(0) = raw_u
+                # which makes jitter width zero, collapsing to a point mass. This is
+                # especially important for motor claim counts where ~85% of rows are zero.
                 prev_u = _discrete_prev_cdf(marginal, arr)
                 raw_u = prev_u + (raw_u - prev_u) * self._rng.uniform(0, 1, size=n)
 
@@ -288,14 +304,33 @@ class InsuranceSynthesizer:
         # Trim to exactly n rows
         rows = rows[:n]
 
-        # Regenerate frequency column using exposure offset
-        if self._frequency_col is not None and self._frequency_rate is not None:
-            exposure = rows[self._exposure_col].to_numpy()
-            lambdas = self._frequency_rate * exposure
-            counts = self._rng.poisson(lambdas)
+        # Scale frequency column by exposure ratio if needed.
+        # We use the copula-sampled frequency directly — this preserves the
+        # dependence structure the copula has learned. We do not redraw from
+        # an unconditional Poisson, which would destroy all dependence.
+        #
+        # If the synthetic exposure deviates from the training mean, we apply
+        # a proportional scaling so the implied claim rate stays consistent.
+        if self._frequency_col is not None and self._mean_exposure is not None:
+            synth_exposure = rows[self._exposure_col].to_numpy().astype(float)
+            raw_counts = rows[self._frequency_col].to_numpy().astype(float)
+
+            # Scale by exposure ratio: count * (synth_exposure / mean_real_exposure)
+            mean_exp = self._mean_exposure
+            scaled = raw_counts * (synth_exposure / max(mean_exp, 1e-9))
+
+            # Round stochastically to preserve expected value
+            floors = np.floor(scaled).astype(int)
+            frac = scaled - floors
+            extra = (self._rng.uniform(size=len(frac)) < frac).astype(int)
+            counts = floors + extra
+
             clip_upper = self._fitted_marginals[self._frequency_col].clip_upper
             if np.isfinite(clip_upper):
                 counts = np.clip(counts, 0, int(clip_upper))
+            else:
+                counts = np.clip(counts, 0, None)
+
             rows = rows.with_columns(
                 pl.Series(name=self._frequency_col, values=counts.astype(int))
             )
@@ -441,9 +476,14 @@ def _discrete_prev_cdf(marginal: FittedMarginal, arr: np.ndarray) -> np.ndarray:
 
     This is the left limit of the CDF just before the jump at each value,
     used to uniformly jitter discrete draws across the CDF step.
+
+    For arr <= 0 (the common zero-count case), we return 0.0 directly.
+    Without this fix, arr=0 would compute CDF(clip(0-1, 0, None)) = CDF(0),
+    which equals CDF(arr), giving zero jitter width and collapsing 85%+ of
+    motor policies to a point mass at zero in the copula.
     """
-    prev = np.clip(arr - 1, 0, None)
-    return np.clip(marginal.cdf(prev), 0.0, 1.0)
+    prev_u = np.where(arr <= 0, 0.0, marginal.cdf(arr - 1))
+    return np.clip(prev_u, 0.0, 1.0)
 
 
 def _build_valid_mask(df: pl.DataFrame, constraints: dict) -> pl.Series:
