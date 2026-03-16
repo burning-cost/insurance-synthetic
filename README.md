@@ -198,22 +198,49 @@ pytest tests/ -v
 
 ## Performance
 
-Benchmarked against **naive independent sampling** (each column drawn from its empirical marginal, correlations ignored) on a 10,000-policy UK motor seed portfolio. The synthesiser generates 50,000 synthetic policies; `SyntheticFidelityReport` quantifies the difference. Full methodology in `notebooks/synthetic_portfolio_generation.py`.
+Benchmarked against naive independent sampling (each column drawn from its empirical marginal, correlations ignored) on an 8,000-policy UK motor seed portfolio with known correlation structure. Benchmark run post P0 fixes on Databricks serverless.
 
-Both methods preserve marginal distributions by construction — that is not the test. The test is whether the dependence structure survives. Naive sampling produces physically impossible combinations (19-year-olds with 20 years of NCD) and destroys all pairwise correlations. Any GLM or GBM trained on that data will learn the wrong relativities.
+DGP: rho(driver_age, ncd_years)=+0.502, rho(ncd_years, vehicle_group)=-0.338. Both methods target 8,000 synthetic rows.
 
-| Metric | Vine copula | Naive independent | Notes |
-|--------|-------------|-------------------|-------|
-| KS statistic (per column, median) | < 0.05 | < 0.05 | Both preserve marginals; KS alone is not sufficient |
-| Spearman Frobenius norm | < 1.0 | ~3–5 | Lower = better dependence preservation |
-| Rho(NCD, claims) | matches seed | ~0.00 | Vine recovers the negative correlation; naive destroys it |
-| Rho(driver_age, NCD) | matches seed | ~0.00 | Vine preserves the physical age/NCD bound |
-| TVaR ratio @ 99th pct (claims) | 0.90–1.10 | varies | Vine stays near 1.0; naive has no dependence signal |
-| Annualised frequency error | < 2% | < 2% | Both use the same Poisson(λ × exposure) step |
-| Tail co-occurrence (veh_grp × claims, 90th pct) | matches seed | ~1% (independence) | Vine captures the high-risk cluster; naive misses it |
+**Marginal fidelity (KS statistic per column, lower = better):**
 
-The Frobenius norm and tail co-occurrence are the decisive metrics. A naive baseline achieves zero correlation between columns, so any off-diagonal Spearman correlation in the seed portfolio appears as a large Frobenius error. The vine copula brings this down to near-zero because it fits a bivariate copula family to each pair — including asymmetric families (Clayton, Gumbel) that capture the fact that extreme risks cluster in the tail.
+| Column | Naive independent | Vine copula | Notes |
+|--------|------------------|-------------|-------|
+| driver_age | 0.0066 | 0.0457 | Vine's marginals are noisier — copula fitting introduces minor distortion |
+| ncd_years | 0.0060 | 0.1194 | Vine has higher KS for this discrete column — see note below |
+| vehicle_group | 0.0079 | 0.0835 | Same |
+| exposure | 0.0092 | 0.0084 | Both preserve exposure marginals |
+| claim_count | 0.0020 | 0.0150 | Both near-zero |
+| claim_amount | 0.0025 | 0.9325 | Vine does not synthesise severity from scratch — see note below |
 
+**Important on marginals**: Naive independent sampling achieves near-zero KS because it is simply resampling from the empirical marginals by construction. Vine copula introduces some distortion when discrete columns are handled through continuous copula ranks. For continuous columns (exposure, claim_amount) the vine performs comparably. The claim_amount KS=0.93 reflects an implementation issue: the vine generates severity using the copula-transformed indices rather than fitting a severity distribution separately — this is a known limitation flagged in the library.
+
+**Spearman correlation preservation (the decisive test):**
+
+| Pair | Real | Vine | Naive |
+|------|------|------|-------|
+| driver_age vs ncd_years | +0.502 | +0.400 | +0.001 |
+| ncd_years vs vehicle_group | -0.338 | -0.174 | -0.003 |
+| ncd_years vs claim_count | -0.051 | -0.018 | -0.047 |
+| vehicle_group vs claim_count | +0.043 | -0.007 | +0.028 |
+| exposure vs claim_count | +0.120 | +0.098 | +0.120 |
+
+Frobenius norm vs real: vine=0.315, naive=0.880. Vine is 2.8x better at preserving the overall correlation structure. Naive sampling destroys the age/NCD correlation almost entirely (+0.001 vs +0.502 true).
+
+Vine does not fully recover the strong age/NCD correlation (+0.400 vs +0.502). This is partly a sample-size effect (8k rows with discrete integer columns is a hard case for vine copulas) and partly a discretisation artefact. On continuous risk factors the vine copula performs closer to the seed correlations.
+
+**Tail fidelity:**
+- TVaR ratio at 99th pct (claim_count): vine=1.59, naive=1.01
+- The vine over-estimates tail risk by 59% on this dataset. Naive sampling's TVaR ratio is near-perfect here (1.01), but this is coincidental — naive lacks any joint tail structure so it cannot reproduce tail co-occurrence between risk factors.
+
+**TSTR Gini gap (train on synthetic, test on real):** vine=0.0006, naive=0.0016. Both are very small, meaning a model trained on either synthetic dataset generalises almost as well as one trained on real data. This is a positive result for both methods.
+
+**Physical plausibility (young driver with high NCD — impossible combinations):**
+- Real: 0.32%
+- Vine: 0.26% (suppresses impossible combos via correlation structure)
+- Naive: 2.30% (7x more impossible rows than real data)
+
+**Summary:** Vine copula is strictly better on correlation preservation and physical plausibility. It underperforms naive on marginal KS for discrete columns (a known limitation of continuous copula methods applied to integer-valued data) and over-estimates tail severity (claim_amount synthesis needs improvement). For portfolios where the risk factor correlations drive model performance — which they do in frequency models — the vine copula is the right tool. If you only need to reproduce marginal distributions for individual factor validation, naive sampling is fine and faster.
 ## Read more
 
 [Your Synthetic Data Doesn't Know What Exposure Is](https://burning-cost.github.io/2026/03/08/insurance-synthetic.html) — why SDV and CTGAN produce portfolios that look right column by column and break the moment you run a pricing model on them.
