@@ -48,6 +48,13 @@ def upload_file(local_path: Path, remote_path: str) -> None:
 
 print("Uploading files to Databricks workspace...")
 
+# Delete and recreate tests/ to avoid stale test files from previous runs
+try:
+    w.workspace.delete(path=f"{WORKSPACE_PATH}/tests", recursive=True)
+    print(f"  Cleared stale tests/ directory")
+except Exception:
+    pass
+
 for subpath in [
     WORKSPACE_PATH,
     f"{WORKSPACE_PATH}/src",

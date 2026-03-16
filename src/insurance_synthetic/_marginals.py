@@ -369,7 +369,6 @@ def fit_marginal(
     # --- Categorical handling ---
     if is_categorical or data.dtype == pl.Utf8 or data.dtype == pl.Categorical:
         counts = data.value_counts(sort=True)
-        categories = counts[""].to_list() if "" in counts.columns else counts[counts.columns[0]].to_list()
         # polars value_counts column name is the series name
         cat_col = col_name if col_name in counts.columns else counts.columns[0]
         categories = counts[cat_col].to_list()

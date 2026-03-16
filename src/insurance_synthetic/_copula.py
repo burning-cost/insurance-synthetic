@@ -93,14 +93,14 @@ class VineCopulaModel:
         if _VINE_AVAILABLE and not self._using_fallback:
             self._fit_vine(u)
         else:
-            if not self._using_fallback:
+            if self._using_fallback and not _VINE_AVAILABLE:
+                # Vine library not installed — warn the user
                 warnings.warn(
                     "pyvinecopulib is not installed. Falling back to Gaussian copula. "
-                    "Install insurance-synthetic[vine] for full vine copula support ",
+                    "Install insurance-synthetic[vine] for full vine copula support.",
                     ImportWarning,
                     stacklevel=3,
                 )
-                self._using_fallback = True
             self._fit_gaussian(u)
 
         self._fitted = True

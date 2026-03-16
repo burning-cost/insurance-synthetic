@@ -7,20 +7,19 @@ The workflow is:
     2. generate() — sample from the vine copula, invert through marginals.
     3. summary() — print fitted marginals and copula structure.
 
-Exposure and frequency handling:
+Exposure handling deserves a note. The exposure column is not modelled
+independently — it is fitted as a marginal and reproduced by the copula
+like any other column. But the frequency column is *conditional* on exposure
+and risk factors: we draw from Poisson(lambda_i * exposure_i) where lambda_i
+is the empirical frequency rate for the risk group that observation belongs to.
 
-The copula models the joint distribution of all columns, including the
-frequency column and the exposure column. In generate(), we use the
-copula-sampled frequency directly rather than redrawing from a Poisson
-with a single global lambda. This preserves the copula-learned dependence
-between claim count and the rating factors (driver age, NCD years, vehicle
-group, etc.) — which is the whole reason we are using a copula in the first
-place.
-
-If the synthetic exposure differs from the original portfolio's average
-exposure, the frequency is scaled by the exposure ratio (synthetic_exposure /
-mean_real_exposure) to keep the implied claim rate consistent. This is a light
-adjustment — the dependence structure is always driven by the copula.
+This is important. A flat portfolio-average rate ignores all risk factor
+variation and produces synthetic claim counts that are uncorrelated with
+the factors that actually drive frequency. We compute empirical rates per
+unique combination of categorical risk factors from the training data, then
+look up the appropriate rate for each synthetic row when generating. Rows
+whose risk-factor combination does not appear in the training data (very rare
+combinations) fall back to the overall portfolio average rate.
 """
 
 from __future__ import annotations
@@ -105,8 +104,9 @@ class InsuranceSynthesizer:
         self._exposure_col: Optional[str] = None
         self._frequency_col: Optional[str] = None
         self._severity_col: Optional[str] = None
-        self._frequency_rate: Optional[float] = None  # lambda = claims / exposure
-        self._mean_exposure: Optional[float] = None   # mean exposure in training data
+        self._frequency_rate: Optional[float] = None  # portfolio-average fallback rate
+        self._frequency_rate_table: Optional[dict] = None  # per risk-group rates
+        self._frequency_rate_cols: Optional[list[str]] = None  # cols used for grouping
         self._categorical_cols: set[str] = set()
         self._is_fitted: bool = False
 
@@ -136,8 +136,9 @@ class InsuranceSynthesizer:
             in df, exposure is assumed to be 1.0 for all rows.
         frequency_col : str
             Name of the claim count column. If present, its marginal is fitted
-            and the copula learns its dependence with other columns. Generation
-            uses the copula-sampled frequency directly, preserving dependence.
+            but generation uses Poisson(lambda_i * exposure_i) to preserve the
+            exposure/frequency relationship, where lambda_i is the empirical
+            rate for the risk-factor group of observation i.
         severity_col : str, optional
             Name of the claim amount column. Fitted as a continuous marginal.
             Zero-inflated (most policies have no claims) — the zero mass is
@@ -194,12 +195,27 @@ class InsuranceSynthesizer:
             )
             self._fitted_marginals[col] = marginal
 
-        # Compute frequency rate and mean exposure for exposure-scaling at generation time
+        # Compute frequency rates: per risk-factor group and portfolio average
         if self._frequency_col is not None:
             total_claims = float(df[self._frequency_col].sum())
             total_exposure = float(df[self._exposure_col].sum())
             self._frequency_rate = total_claims / max(total_exposure, 1e-9)
-            self._mean_exposure = float(df[self._exposure_col].mean())
+            # Build per-group rate table using categorical columns (excluding
+            # frequency and exposure themselves) as grouping keys.
+            rate_cols = [
+                c for c in df.columns
+                if c in self._categorical_cols
+                and c != self._frequency_col
+                and c != self._exposure_col
+            ]
+            if rate_cols:
+                rate_table = _compute_group_rates(df, rate_cols, frequency_col, exposure_col)
+                self._frequency_rate_table = rate_table
+                self._frequency_rate_cols = rate_cols
+            else:
+                # No categorical grouping columns — fall back to portfolio average
+                self._frequency_rate_table = None
+                self._frequency_rate_cols = None
 
         # PIT transform all columns to uniform [0,1]
         u_matrix = self._pit_transform(df)
@@ -304,27 +320,14 @@ class InsuranceSynthesizer:
         # Trim to exactly n rows
         rows = rows[:n]
 
-        # Scale frequency column by exposure ratio if needed.
-        # We use the copula-sampled frequency directly — this preserves the
-        # dependence structure the copula has learned. We do not redraw from
-        # an unconditional Poisson, which would destroy all dependence.
-        #
-        # If the synthetic exposure deviates from the training mean, we apply
-        # a proportional scaling so the implied claim rate stays consistent.
-        if self._frequency_col is not None and self._mean_exposure is not None:
-            synth_exposure = rows[self._exposure_col].to_numpy().astype(float)
-            raw_counts = rows[self._frequency_col].to_numpy().astype(float)
-
-            # Scale by exposure ratio: count * (synth_exposure / mean_real_exposure)
-            mean_exp = self._mean_exposure
-            scaled = raw_counts * (synth_exposure / max(mean_exp, 1e-9))
-
-            # Round stochastically to preserve expected value
-            floors = np.floor(scaled).astype(int)
-            frac = scaled - floors
-            extra = (self._rng.uniform(size=len(frac)) < frac).astype(int)
-            counts = floors + extra
-
+        # Regenerate frequency column conditional on exposure and risk factors.
+        # We use per-group empirical rates rather than a single portfolio average.
+        # This ensures the synthetic claim counts are correlated with the risk
+        # factors that drive frequency, not just with exposure.
+        if self._frequency_col is not None and self._frequency_rate is not None:
+            exposure = rows[self._exposure_col].to_numpy()
+            lambdas = self._compute_row_rates(rows) * exposure
+            counts = self._rng.poisson(lambdas)
             clip_upper = self._fitted_marginals[self._frequency_col].clip_upper
             if np.isfinite(clip_upper):
                 counts = np.clip(counts, 0, int(clip_upper))
@@ -336,6 +339,34 @@ class InsuranceSynthesizer:
             )
 
         return rows
+
+    def _compute_row_rates(self, rows: pl.DataFrame) -> np.ndarray:
+        """
+        Look up the empirical frequency rate for each row.
+
+        For rows whose risk-factor combination appears in the training data,
+        return the empirical rate for that group. For all other rows, fall back
+        to the portfolio average rate.
+
+        Returns an array of per-row annualised frequency rates (claims/year).
+        """
+        n = len(rows)
+        rates = np.full(n, self._frequency_rate, dtype=float)
+
+        if self._frequency_rate_table is None or not self._frequency_rate_cols:
+            return rates
+
+        rate_cols = self._frequency_rate_cols
+        rate_table = self._frequency_rate_table
+
+        # Build a tuple key per row from the grouping columns and look up rates
+        col_arrays = [rows[c].to_list() for c in rate_cols]
+        for i in range(n):
+            key = tuple(col_arrays[j][i] for j in range(len(rate_cols)))
+            if key in rate_table:
+                rates[i] = rate_table[key]
+
+        return rates
 
     def _generate_raw(self, n: int) -> pl.DataFrame:
         """
@@ -429,8 +460,14 @@ class InsuranceSynthesizer:
         if self._frequency_col:
             lines.append(
                 f"Frequency column: '{self._frequency_col}' "
-                f"(rate lambda = {self._frequency_rate:.4f} claims/year)"
+                f"(portfolio average rate = {self._frequency_rate:.4f} claims/year)"
             )
+            if self._frequency_rate_cols:
+                n_groups = len(self._frequency_rate_table) if self._frequency_rate_table else 0
+                lines.append(
+                    f"  Per-group rates computed on: {self._frequency_rate_cols} "
+                    f"({n_groups} unique groups)"
+                )
         if self._exposure_col:
             lines.append(f"Exposure column: '{self._exposure_col}'")
 
@@ -469,6 +506,34 @@ class InsuranceSynthesizer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _compute_group_rates(
+    df: pl.DataFrame,
+    rate_cols: list[str],
+    frequency_col: str,
+    exposure_col: str,
+) -> dict:
+    """
+    Compute empirical frequency rates per unique combination of rate_cols.
+
+    Returns a dict mapping tuple(group values) -> rate (claims / exposure).
+    Groups with zero exposure are excluded.
+    """
+    # Group by all categorical columns and sum claims and exposure
+    agg = df.group_by(rate_cols).agg([
+        pl.col(frequency_col).sum().alias("_claims"),
+        pl.col(exposure_col).sum().alias("_exposure"),
+    ])
+
+    rate_table = {}
+    for row in agg.iter_rows(named=True):
+        exposure = row["_exposure"]
+        if exposure > 0:
+            key = tuple(row[c] for c in rate_cols)
+            rate_table[key] = row["_claims"] / exposure
+
+    return rate_table
+
 
 def _discrete_prev_cdf(marginal: FittedMarginal, arr: np.ndarray) -> np.ndarray:
     """

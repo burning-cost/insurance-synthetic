@@ -295,6 +295,11 @@ class SyntheticFidelityReport:
         the synthetic model uses all of synthetic_df (same size by convention
         or truncated to match).
 
+        The loss function is chosen automatically based on the target column
+        dtype: integer columns use Poisson loss (appropriate for claim counts),
+        float/continuous columns use RMSE (appropriate for severities and
+        premiums).
+
         Requires catboost to be installed (`pip install insurance-synthetic[fidelity]`).
 
         Parameters
@@ -332,6 +337,17 @@ class SyntheticFidelityReport:
             if self.real_df[c].dtype in (pl.Utf8, pl.Categorical, pl.String)
         ]
 
+        # Detect whether the target is count/integer (use Poisson loss) or
+        # continuous/float (use RMSE). Poisson loss is appropriate for claim
+        # counts; RMSE is safer for severity and premium columns that can have
+        # arbitrary non-negative float values.
+        target_dtype = self.real_df[self.target_col].dtype
+        _integer_dtypes = (
+            pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+            pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+        )
+        loss_function = "Poisson" if target_dtype in _integer_dtypes else "RMSE"
+
         # Split real data into train / test
         rng = np.random.default_rng(random_state)
         n_real = len(self.real_df)
@@ -365,7 +381,7 @@ class SyntheticFidelityReport:
             "iterations": catboost_iterations,
             "learning_rate": 0.1,
             "depth": 4,
-            "loss_function": "Poisson",
+            "loss_function": loss_function,
             "verbose": False,
             "random_seed": random_state,
         }
