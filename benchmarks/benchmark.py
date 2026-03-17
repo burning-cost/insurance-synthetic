@@ -216,8 +216,8 @@ print("  Lower Frobenius = better correlation preservation")
 # ---------------------------------------------------------------------------
 # 6. TVaR ratio at 99th percentile
 # ---------------------------------------------------------------------------
-tvar_ratio_vine = report_vine.tvar_ratio("claim_count", pct=0.99)
-tvar_ratio_naive = report_naive.tvar_ratio("claim_count", pct=0.99)
+tvar_ratio_vine = report_vine.tvar_ratio("claim_count", percentile=0.99)
+tvar_ratio_naive = report_naive.tvar_ratio("claim_count", percentile=0.99)
 
 print("\n" + "=" * 70)
 print("TABLE 3: Tail risk preservation (TVaR ratio at 99th pct, claim_count)")
