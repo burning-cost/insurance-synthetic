@@ -4,17 +4,22 @@ InsuranceSynthesizer: the main entry point for synthetic portfolio generation.
 The workflow is:
     1. fit() — fit a marginal distribution per column, then a vine copula
                on the probability-integral-transformed (PIT) data.
-    2. generate() — sample from the vine copula, invert through marginals,
-                    regenerate frequency columns using exposure offset.
+    2. generate() — sample from the vine copula, invert through marginals.
     3. summary() — print fitted marginals and copula structure.
 
 Exposure handling deserves a note. The exposure column is not modelled
 independently — it is fitted as a marginal and reproduced by the copula
-like any other column. But the frequency column is *conditional* on exposure:
-we draw from Poisson(lambda * exposure) where lambda is the fitted rate,
-not simply invert the frequency marginal. This preserves the frequency/
-exposure relationship that actuaries depend on (e.g., annualised claim rate
-should be stable regardless of how we slice the portfolio).
+like any other column. But the frequency column is *conditional* on exposure
+and risk factors: we draw from Poisson(lambda_i * exposure_i) where lambda_i
+is the empirical frequency rate for the risk group that observation belongs to.
+
+This is important. A flat portfolio-average rate ignores all risk factor
+variation and produces synthetic claim counts that are uncorrelated with
+the factors that actually drive frequency. We compute empirical rates per
+unique combination of categorical risk factors from the training data, then
+look up the appropriate rate for each synthetic row when generating. Rows
+whose risk-factor combination does not appear in the training data (very rare
+combinations) fall back to the overall portfolio average rate.
 """
 
 from __future__ import annotations
@@ -99,7 +104,9 @@ class InsuranceSynthesizer:
         self._exposure_col: Optional[str] = None
         self._frequency_col: Optional[str] = None
         self._severity_col: Optional[str] = None
-        self._frequency_rate: Optional[float] = None  # lambda = claims / exposure
+        self._frequency_rate: Optional[float] = None  # portfolio-average fallback rate
+        self._frequency_rate_table: Optional[dict] = None  # per risk-group rates
+        self._frequency_rate_cols: Optional[list[str]] = None  # cols used for grouping
         self._categorical_cols: set[str] = set()
         self._is_fitted: bool = False
 
@@ -129,8 +136,9 @@ class InsuranceSynthesizer:
             in df, exposure is assumed to be 1.0 for all rows.
         frequency_col : str
             Name of the claim count column. If present, its marginal is fitted
-            but generation uses Poisson(lambda * exposure) to preserve the
-            exposure/frequency relationship.
+            but generation uses Poisson(lambda_i * exposure_i) to preserve the
+            exposure/frequency relationship, where lambda_i is the empirical
+            rate for the risk-factor group of observation i.
         severity_col : str, optional
             Name of the claim amount column. Fitted as a continuous marginal.
             Zero-inflated (most policies have no claims) — the zero mass is
@@ -187,11 +195,27 @@ class InsuranceSynthesizer:
             )
             self._fitted_marginals[col] = marginal
 
-        # Compute frequency rate: overall lambda = total_claims / total_exposure
+        # Compute frequency rates: per risk-factor group and portfolio average
         if self._frequency_col is not None:
             total_claims = float(df[self._frequency_col].sum())
             total_exposure = float(df[self._exposure_col].sum())
             self._frequency_rate = total_claims / max(total_exposure, 1e-9)
+            # Build per-group rate table using categorical columns (excluding
+            # frequency and exposure themselves) as grouping keys.
+            rate_cols = [
+                c for c in df.columns
+                if c in self._categorical_cols
+                and c != self._frequency_col
+                and c != self._exposure_col
+            ]
+            if rate_cols:
+                rate_table = _compute_group_rates(df, rate_cols, frequency_col, exposure_col)
+                self._frequency_rate_table = rate_table
+                self._frequency_rate_cols = rate_cols
+            else:
+                # No categorical grouping columns — fall back to portfolio average
+                self._frequency_rate_table = None
+                self._frequency_rate_cols = None
 
         # PIT transform all columns to uniform [0,1]
         u_matrix = self._pit_transform(df)
@@ -213,8 +237,12 @@ class InsuranceSynthesizer:
 
         Returns an (n, d) array of uniform [0,1] values. Categoricals are
         mapped through their empirical CDF. Ties in discrete columns are
-        resolved by adding uniform jitter in [0, 1/n] — the standard approach
-        for fitting copulas to discrete data.
+        resolved by adding uniform jitter in [prev_u, u] — the standard
+        approach for fitting copulas to discrete data.
+
+        For zero counts (the common case in motor — 85%+ of policies have
+        zero claims), prev_u is set to 0.0 rather than CDF(0 - 1) = CDF(-1),
+        which would be CDF(0) due to clipping and collapse to a point mass.
         """
         n = len(df)
         d = len(df.columns)
@@ -235,7 +263,11 @@ class InsuranceSynthesizer:
 
             # Discrete / categorical jitter to avoid ties at CDF steps
             if marginal.kind in ("discrete", "categorical"):
-                # Step back one CDF increment, then add uniform jitter across the step
+                # Step back one CDF increment, then add uniform jitter across the step.
+                # For arr == 0 (or any arr at the left boundary), prev_u = 0.0 rather
+                # than CDF(arr - 1) — because for arr=0, CDF(0-1) clips to CDF(0) = raw_u
+                # which makes jitter width zero, collapsing to a point mass. This is
+                # especially important for motor claim counts where ~85% of rows are zero.
                 prev_u = _discrete_prev_cdf(marginal, arr)
                 raw_u = prev_u + (raw_u - prev_u) * self._rng.uniform(0, 1, size=n)
 
@@ -288,19 +320,53 @@ class InsuranceSynthesizer:
         # Trim to exactly n rows
         rows = rows[:n]
 
-        # Regenerate frequency column using exposure offset
+        # Regenerate frequency column conditional on exposure and risk factors.
+        # We use per-group empirical rates rather than a single portfolio average.
+        # This ensures the synthetic claim counts are correlated with the risk
+        # factors that drive frequency, not just with exposure.
         if self._frequency_col is not None and self._frequency_rate is not None:
             exposure = rows[self._exposure_col].to_numpy()
-            lambdas = self._frequency_rate * exposure
+            lambdas = self._compute_row_rates(rows) * exposure
             counts = self._rng.poisson(lambdas)
             clip_upper = self._fitted_marginals[self._frequency_col].clip_upper
             if np.isfinite(clip_upper):
                 counts = np.clip(counts, 0, int(clip_upper))
+            else:
+                counts = np.clip(counts, 0, None)
+
             rows = rows.with_columns(
                 pl.Series(name=self._frequency_col, values=counts.astype(int))
             )
 
         return rows
+
+    def _compute_row_rates(self, rows: pl.DataFrame) -> np.ndarray:
+        """
+        Look up the empirical frequency rate for each row.
+
+        For rows whose risk-factor combination appears in the training data,
+        return the empirical rate for that group. For all other rows, fall back
+        to the portfolio average rate.
+
+        Returns an array of per-row annualised frequency rates (claims/year).
+        """
+        n = len(rows)
+        rates = np.full(n, self._frequency_rate, dtype=float)
+
+        if self._frequency_rate_table is None or not self._frequency_rate_cols:
+            return rates
+
+        rate_cols = self._frequency_rate_cols
+        rate_table = self._frequency_rate_table
+
+        # Build a tuple key per row from the grouping columns and look up rates
+        col_arrays = [rows[c].to_list() for c in rate_cols]
+        for i in range(n):
+            key = tuple(col_arrays[j][i] for j in range(len(rate_cols)))
+            if key in rate_table:
+                rates[i] = rate_table[key]
+
+        return rates
 
     def _generate_raw(self, n: int) -> pl.DataFrame:
         """
@@ -394,8 +460,14 @@ class InsuranceSynthesizer:
         if self._frequency_col:
             lines.append(
                 f"Frequency column: '{self._frequency_col}' "
-                f"(rate lambda = {self._frequency_rate:.4f} claims/year)"
+                f"(portfolio average rate = {self._frequency_rate:.4f} claims/year)"
             )
+            if self._frequency_rate_cols:
+                n_groups = len(self._frequency_rate_table) if self._frequency_rate_table else 0
+                lines.append(
+                    f"  Per-group rates computed on: {self._frequency_rate_cols} "
+                    f"({n_groups} unique groups)"
+                )
         if self._exposure_col:
             lines.append(f"Exposure column: '{self._exposure_col}'")
 
@@ -435,15 +507,48 @@ class InsuranceSynthesizer:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _compute_group_rates(
+    df: pl.DataFrame,
+    rate_cols: list[str],
+    frequency_col: str,
+    exposure_col: str,
+) -> dict:
+    """
+    Compute empirical frequency rates per unique combination of rate_cols.
+
+    Returns a dict mapping tuple(group values) -> rate (claims / exposure).
+    Groups with zero exposure are excluded.
+    """
+    # Group by all categorical columns and sum claims and exposure
+    agg = df.group_by(rate_cols).agg([
+        pl.col(frequency_col).sum().alias("_claims"),
+        pl.col(exposure_col).sum().alias("_exposure"),
+    ])
+
+    rate_table = {}
+    for row in agg.iter_rows(named=True):
+        exposure = row["_exposure"]
+        if exposure > 0:
+            key = tuple(row[c] for c in rate_cols)
+            rate_table[key] = row["_claims"] / exposure
+
+    return rate_table
+
+
 def _discrete_prev_cdf(marginal: FittedMarginal, arr: np.ndarray) -> np.ndarray:
     """
     Return CDF at arr - 1 for discrete marginals, clipped to [0, 1].
 
     This is the left limit of the CDF just before the jump at each value,
     used to uniformly jitter discrete draws across the CDF step.
+
+    For arr <= 0 (the common zero-count case), we return 0.0 directly.
+    Without this fix, arr=0 would compute CDF(clip(0-1, 0, None)) = CDF(0),
+    which equals CDF(arr), giving zero jitter width and collapsing 85%+ of
+    motor policies to a point mass at zero in the copula.
     """
-    prev = np.clip(arr - 1, 0, None)
-    return np.clip(marginal.cdf(prev), 0.0, 1.0)
+    prev_u = np.where(arr <= 0, 0.0, marginal.cdf(arr - 1))
+    return np.clip(prev_u, 0.0, 1.0)
 
 
 def _build_valid_mask(df: pl.DataFrame, constraints: dict) -> pl.Series:

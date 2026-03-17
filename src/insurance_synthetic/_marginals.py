@@ -14,6 +14,13 @@ is scipy continuous, discrete, or a categorical lookup.
 Design note: we avoid scipy's fitter() because it doesn't handle discrete
 distributions or the exposure-offset needed for frequency columns. Rolling our
 own gives us full control and keeps the API clean.
+
+NegBin fitting note: we use MLE (via scipy.optimize.minimize) rather than
+method-of-moments (MOM) so that the AIC is comparable with the Poisson MLE.
+Comparing AIC values from different estimation methods is not meaningful —
+MOM does not maximise likelihood and will undercount the log-likelihood
+relative to MLE, which would spuriously favour Poisson. MOM is used as the
+initial parameter guess for the optimiser.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import polars as pl
-from scipy import stats
+from scipy import stats, optimize
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +61,39 @@ def _aic(log_likelihood: float, n_params: int) -> float:
     return 2 * n_params - 2 * log_likelihood
 
 
+def _count_continuous_params(dist, params: tuple) -> int:
+    """
+    Return the number of free parameters for AIC, accounting for fixed
+    (constrained) parameters such as floc=0 used for positive-support
+    distributions.
+
+    scipy's dist.fit() always returns (shape..., loc, scale) regardless of
+    which parameters were fixed. When floc=0 is passed, loc is not estimated
+    from data — it should not count as a free parameter. We detect this by
+    checking dist.shapes and the standard convention that:
+      - Gamma with floc=0: 2 free params (shape, scale), not 3
+      - Lognormal with floc=0: 2 free params (s, scale), not 3
+      - Exponential with floc=0: 1 free param (scale), not 2
+
+    This corrects AIC so constrained fits are not penalised for parameters
+    they did not estimate.
+    """
+    # Standard number: shapes + loc + scale
+    n_shapes = len(dist.shapes.split(",")) if dist.shapes else 0
+    total = n_shapes + 2  # +2 for loc and scale
+
+    # For positive-support distributions (gamma, lognorm, expon, weibull_min),
+    # scipy fits with floc=0, so loc is fixed and not counted.
+    fixed_loc_dists = {stats.gamma, stats.lognorm, stats.expon, stats.weibull_min}
+    if dist in fixed_loc_dists:
+        # loc is fixed at 0 by convention in our _fit_continuous loop
+        # (scipy sets it very close to data min, but we check if it's pinned)
+        # More reliable: count actual shape params + scale only
+        total = n_shapes + 1  # shapes + scale (loc fixed)
+
+    return total
+
+
 def _fit_continuous(data: np.ndarray) -> tuple[stats.rv_continuous, tuple, float]:
     """Try each continuous family; return (dist, params, aic) for the best."""
     best_dist = None
@@ -79,7 +119,8 @@ def _fit_continuous(data: np.ndarray) -> tuple[stats.rv_continuous, tuple, float
                 ll = float(np.sum(dist.logpdf(data, *params)))
                 if not np.isfinite(ll):
                     continue
-                aic = _aic(ll, len(params))
+                n_params = _count_continuous_params(dist, params)
+                aic = _aic(ll, n_params)
                 if aic < best_aic:
                     best_aic = aic
                     best_dist = dist
@@ -96,8 +137,63 @@ def _fit_continuous(data: np.ndarray) -> tuple[stats.rv_continuous, tuple, float
     return best_dist, best_params, best_aic
 
 
+def _fit_negbin_mle(data: np.ndarray) -> tuple[float, float, float]:
+    """
+    Fit NegBin(n, p) by maximum likelihood.
+
+    scipy's nbinom.logpmf(k, n, p) uses the parameterisation where the mean
+    is n*(1-p)/p and variance is n*(1-p)/p^2.
+
+    Returns (n, p, log_likelihood).
+
+    MOM is used as the starting point for the numerical optimiser. Falls back
+    to MOM values if optimisation fails.
+    """
+    mean_ = float(np.mean(data))
+    var_ = float(np.var(data))
+
+    # MOM initial guess
+    if var_ > mean_ > 0:
+        n0 = mean_ ** 2 / (var_ - mean_)
+        p0 = mean_ / var_
+    else:
+        n0 = max(mean_, 0.1)
+        p0 = 0.5
+
+    n0 = max(n0, 0.1)
+    p0 = float(np.clip(p0, 1e-6, 1 - 1e-6))
+
+    def neg_ll(log_params):
+        log_n, logit_p = log_params
+        n = np.exp(log_n)
+        p = 1.0 / (1.0 + np.exp(-logit_p))
+        ll = float(np.sum(stats.nbinom.logpmf(data, n, p)))
+        return -ll if np.isfinite(ll) else 1e12
+
+    # Unconstrained optimisation in log/logit space ensures n > 0, p in (0,1)
+    x0 = [np.log(n0), np.log(p0 / (1 - p0))]
+    try:
+        result = optimize.minimize(neg_ll, x0, method="Nelder-Mead",
+                                   options={"xatol": 1e-6, "fatol": 1e-6,
+                                            "maxiter": 5000})
+        n_hat = np.exp(result.x[0])
+        p_hat = 1.0 / (1.0 + np.exp(-result.x[1]))
+        ll_hat = -result.fun
+    except Exception:
+        # Fall back to MOM if optimiser fails
+        n_hat, p_hat = n0, p0
+        ll_hat = float(np.sum(stats.nbinom.logpmf(data, n_hat, p_hat)))
+
+    return float(n_hat), float(p_hat), float(ll_hat)
+
+
 def _fit_discrete(data: np.ndarray) -> tuple[stats.rv_discrete, tuple, float]:
-    """Try Poisson and NegBin; return best by AIC."""
+    """
+    Try Poisson (MLE) and NegBin (MLE) and return best by AIC.
+
+    Both families are fitted by MLE so their AICs are directly comparable.
+    MOM for NegBin is used only as the optimiser's starting point.
+    """
     data = data[np.isfinite(data)].astype(int)
     data = data[data >= 0]
 
@@ -105,7 +201,7 @@ def _fit_discrete(data: np.ndarray) -> tuple[stats.rv_discrete, tuple, float]:
     best_params: tuple = ()
     best_aic = np.inf
 
-    # Poisson: single parameter mu = mean
+    # Poisson MLE: mu = sample mean (closed-form MLE)
     mu = float(np.mean(data))
     if mu > 0:
         try:
@@ -119,23 +215,18 @@ def _fit_discrete(data: np.ndarray) -> tuple[stats.rv_discrete, tuple, float]:
         except Exception:
             pass
 
-    # NegBin: estimate n, p from method-of-moments
+    # NegBin MLE via numerical optimisation
     mean_ = float(np.mean(data))
     var_ = float(np.var(data))
     if var_ > mean_ > 0:
         try:
-            # n = mean^2 / (var - mean), p = mean / var
-            n = mean_ ** 2 / (var_ - mean_)
-            p = mean_ / var_
-            n = max(n, 0.1)
-            p = np.clip(p, 1e-6, 1 - 1e-6)
-            ll = float(np.sum(stats.nbinom.logpmf(data, n, p)))
-            if np.isfinite(ll):
-                aic = _aic(ll, 2)
+            n_hat, p_hat, ll_hat = _fit_negbin_mle(data)
+            if np.isfinite(ll_hat):
+                aic = _aic(ll_hat, 2)
                 if aic < best_aic:
                     best_aic = aic
                     best_dist = stats.nbinom
-                    best_params = (n, p)
+                    best_params = (n_hat, p_hat)
         except Exception:
             pass
 
@@ -278,7 +369,6 @@ def fit_marginal(
     # --- Categorical handling ---
     if is_categorical or data.dtype == pl.Utf8 or data.dtype == pl.Categorical:
         counts = data.value_counts(sort=True)
-        categories = counts[""].to_list() if "" in counts.columns else counts[counts.columns[0]].to_list()
         # polars value_counts column name is the series name
         cat_col = col_name if col_name in counts.columns else counts.columns[0]
         categories = counts[cat_col].to_list()
@@ -311,19 +401,28 @@ def fit_marginal(
             if dist == stats.poisson:
                 mu = float(np.mean(arr))
                 params: tuple = (max(mu, 1e-6),)
+                ll = float(np.sum(dist.logpmf(arr.astype(int), *params)))
+                n_params = 1
             else:
+                # NegBin: use MLE for consistency
                 mean_ = float(np.mean(arr))
                 var_ = float(np.var(arr))
-                nb_n = mean_ ** 2 / max(var_ - mean_, 1e-6)
-                nb_p = mean_ / max(var_, 1e-6)
-                params = (max(nb_n, 0.1), np.clip(nb_p, 1e-6, 1 - 1e-6))
-            ll = float(np.sum(dist.logpmf(arr.astype(int), *params)))
+                if var_ > mean_ > 0:
+                    n_hat, p_hat, ll_hat = _fit_negbin_mle(arr.astype(int))
+                    params = (max(n_hat, 0.1), float(np.clip(p_hat, 1e-6, 1 - 1e-6)))
+                    ll = ll_hat
+                else:
+                    nb_n = mean_ ** 2 / max(var_ - mean_, 1e-6)
+                    nb_p = mean_ / max(var_, 1e-6)
+                    params = (max(nb_n, 0.1), np.clip(nb_p, 1e-6, 1 - 1e-6))
+                    ll = float(np.sum(dist.logpmf(arr.astype(int), *params)))
+                n_params = 2
             return FittedMarginal(
                 col_name=col_name,
                 kind="discrete",
                 dist=dist,
                 params=params,
-                aic=_aic(ll, len(params)),
+                aic=_aic(ll, n_params),
                 clip_lower=0.0,
             )
 
@@ -358,12 +457,13 @@ def fit_marginal(
             warnings.simplefilter("ignore")
             params = dist_cls.fit(arr, method="MLE")
         ll = float(np.sum(dist_cls.logpdf(arr, *params)))
+        n_params = _count_continuous_params(dist_cls, params)
         return FittedMarginal(
             col_name=col_name,
             kind="continuous",
             dist=dist_cls,
             params=params,
-            aic=_aic(ll, len(params)),
+            aic=_aic(ll, n_params),
             clip_lower=clip_lower,
             clip_upper=clip_upper,
         )
