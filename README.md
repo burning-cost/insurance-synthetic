@@ -47,10 +47,10 @@ This gives correct severity marginals for claimers while preserving the zero-inf
 ## Installation
 
 ```bash
-pip install insurance-synthetic
+uv add insurance-synthetic
 
 # With TSTR fidelity scoring (requires CatBoost):
-pip install insurance-synthetic[fidelity]
+uv add "insurance-synthetic[fidelity]"
 ```
 
 Requires Python 3.10+.
