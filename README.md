@@ -40,6 +40,8 @@ pip install insurance-synthetic[fidelity]
 
 Requires Python 3.10+.
 
+> 💬 Questions or feedback? Start a [Discussion](https://github.com/burning-cost/insurance-synthetic/discussions). Found it useful? A ⭐ helps others find it.
+
 ## Quick start
 
 ```python
