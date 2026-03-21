@@ -20,6 +20,20 @@ unique combination of categorical risk factors from the training data, then
 look up the appropriate rate for each synthetic row when generating. Rows
 whose risk-factor combination does not appear in the training data (very rare
 combinations) fall back to the overall portfolio average rate.
+
+Severity handling: the claim_amount column is excluded from the vine copula.
+Zero-inflated columns (most policies have no claims) break continuous copula
+fitting — the massive point mass at zero causes the fitted marginal CDF to
+collapse, producing KS statistics near 1.0. Instead, we:
+
+    1. Fit the severity marginal on non-zero observations only (the actual
+       severity distribution, conditional on a claim occurring).
+    2. In generate(), draw severity independently from the fitted marginal
+       for each row where claim_count > 0. Non-claimers get severity = 0.
+
+This is the actuarially correct treatment: severity is a separate model from
+frequency. Joint modelling via the copula would require a copula that handles
+zero-inflation, which pyvinecopulib does not expose cleanly.
 """
 
 from __future__ import annotations
@@ -99,8 +113,10 @@ class InsuranceSynthesizer:
 
         # Set after fitting
         self._fitted_marginals: dict[str, FittedMarginal] = {}
+        self._severity_marginal: Optional[FittedMarginal] = None  # fitted on non-zero only
         self._copula: Optional[VineCopulaModel] = None
-        self._columns: list[str] = []
+        self._columns: list[str] = []  # columns passed to the vine copula (excludes severity)
+        self._all_columns: list[str] = []  # original column order (for output)
         self._exposure_col: Optional[str] = None
         self._frequency_col: Optional[str] = None
         self._severity_col: Optional[str] = None
@@ -140,9 +156,12 @@ class InsuranceSynthesizer:
             exposure/frequency relationship, where lambda_i is the empirical
             rate for the risk-factor group of observation i.
         severity_col : str, optional
-            Name of the claim amount column. Fitted as a continuous marginal.
-            Zero-inflated (most policies have no claims) — the zero mass is
-            absorbed by placing a point mass at the lower tail.
+            Name of the claim amount column. Excluded from the vine copula —
+            instead, a severity marginal is fitted on non-zero observations
+            only (the conditional severity distribution). Generation draws
+            from this marginal for rows where claim_count > 0; all other rows
+            get severity = 0. This is the correct actuarial treatment of
+            zero-inflated severity.
         categorical_cols : list of str, optional
             Columns to treat as categorical. Auto-detected for string/Utf8
             columns; pass this to force integer columns to be treated as
@@ -167,7 +186,7 @@ class InsuranceSynthesizer:
         self._exposure_col = exposure_col
         self._frequency_col = frequency_col if frequency_col in df.columns else None
         self._severity_col = severity_col if severity_col and severity_col in df.columns else None
-        self._columns = df.columns
+        self._all_columns = df.columns
         self._categorical_cols = set(categorical_cols or [])
 
         # Auto-detect string columns as categorical
@@ -177,7 +196,7 @@ class InsuranceSynthesizer:
 
         force_discrete = set(discrete_cols or [])
 
-        # Fit marginal per column
+        # Fit marginal per column (including severity — used in summary())
         marginal_overrides: dict = {}
         if isinstance(self.marginals_spec, dict):
             marginal_overrides = self.marginals_spec
@@ -194,6 +213,31 @@ class InsuranceSynthesizer:
                 is_discrete=is_disc,
             )
             self._fitted_marginals[col] = marginal
+
+        # Fit a separate severity marginal on non-zero claim amounts only.
+        # Zero-inflated columns break continuous copula fitting: the huge
+        # point mass at zero collapses the CDF and produces KS near 1.0.
+        # We exclude severity from the vine and handle it separately at
+        # generation time (severity given a claim occurred).
+        if self._severity_col is not None:
+            sev_series = df[self._severity_col]
+            nonzero_sev = sev_series.filter(sev_series > 0)
+            if len(nonzero_sev) >= 4:
+                sev_family = marginal_overrides.get(self._severity_col, "auto")
+                self._severity_marginal = fit_marginal(
+                    nonzero_sev,
+                    family=sev_family,
+                    is_categorical=False,
+                    is_discrete=False,
+                )
+            else:
+                warnings.warn(
+                    f"severity_col '{self._severity_col}' has fewer than 4 non-zero "
+                    "observations. Severity synthesis will produce zeros only.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._severity_marginal = None
 
         # Compute frequency rates: per risk-factor group and portfolio average
         if self._frequency_col is not None:
@@ -217,8 +261,12 @@ class InsuranceSynthesizer:
                 self._frequency_rate_table = None
                 self._frequency_rate_cols = None
 
-        # PIT transform all columns to uniform [0,1]
-        u_matrix = self._pit_transform(df)
+        # Columns passed to the vine copula: exclude severity (handled separately)
+        copula_cols = [c for c in df.columns if c != self._severity_col]
+        self._columns = copula_cols
+
+        # PIT transform copula columns to uniform [0,1]
+        u_matrix = self._pit_transform(df.select(copula_cols))
 
         # Fit vine copula
         self._copula = VineCopulaModel(
@@ -337,6 +385,40 @@ class InsuranceSynthesizer:
             rows = rows.with_columns(
                 pl.Series(name=self._frequency_col, values=counts.astype(int))
             )
+        else:
+            counts = None
+
+        # Regenerate severity column independently for each claimer row.
+        # Severity is NOT modelled through the vine copula — zero-inflation
+        # in the raw column makes copula fitting fail (KS near 1.0). Instead:
+        #   - rows with claim_count > 0 get severity drawn from the conditional
+        #     severity marginal (fitted on non-zero claims from training data)
+        #   - rows with claim_count == 0 get severity = 0.0
+        if self._severity_col is not None:
+            if counts is not None:
+                has_claim = counts > 0
+            elif self._frequency_col is not None and self._frequency_col in rows.columns:
+                has_claim = rows[self._frequency_col].to_numpy() > 0
+            else:
+                # No frequency information — draw severity for all rows
+                has_claim = np.ones(n, dtype=bool)
+
+            severity = np.zeros(n, dtype=float)
+            n_claimers = int(has_claim.sum())
+
+            if n_claimers > 0 and self._severity_marginal is not None:
+                u_sev = self._rng.uniform(0, 1, size=n_claimers)
+                sev_values = self._severity_marginal.ppf(u_sev)
+                sev_values = np.maximum(sev_values, 0.0)
+                severity[has_claim] = sev_values
+
+            rows = rows.with_columns(
+                pl.Series(name=self._severity_col, values=severity.tolist(), dtype=pl.Float64)
+            )
+
+        # Reorder columns to match original input order (severity was excluded from vine)
+        output_cols = [c for c in self._all_columns if c in rows.columns]
+        rows = rows.select(output_cols)
 
         return rows
 
@@ -372,6 +454,7 @@ class InsuranceSynthesizer:
         """
         Sample from the vine copula and invert through marginals.
         Returns a DataFrame in the original column scale.
+        Note: severity column is excluded — it is handled in generate().
         """
         u = self._copula.simulate(n, rng=self._rng)  # (n, d)
 
@@ -470,14 +553,25 @@ class InsuranceSynthesizer:
                 )
         if self._exposure_col:
             lines.append(f"Exposure column: '{self._exposure_col}'")
+        if self._severity_col:
+            lines.append(
+                f"Severity column: '{self._severity_col}' "
+                f"(fitted independently on non-zero claims, excluded from vine copula)"
+            )
 
         lines.append("\nFitted marginals:")
-        lines.append(f"  {'Column':<25} {'Kind':<12} {'Family':<25} {'AIC':>10}")
-        lines.append("  " + "-" * 75)
+        lines.append(f"  {'Column':<25} {'Kind':<12} {'Family':<25} {'AIC':>10}  {'Note'}")
+        lines.append("  " + "-" * 85)
         for col, m in self._fitted_marginals.items():
             aic_str = f"{m.aic:.1f}" if np.isfinite(m.aic) else "—"
+            note = ""
+            if col == self._severity_col:
+                if self._severity_marginal is not None:
+                    note = f"(copula-excluded; conditional marginal: {self._severity_marginal.family_name()})"
+                else:
+                    note = "(copula-excluded; insufficient non-zero claims)"
             lines.append(
-                f"  {col:<25} {m.kind:<12} {m.family_name():<25} {aic_str:>10}"
+                f"  {col:<25} {m.kind:<12} {m.family_name():<25} {aic_str:>10}  {note}"
             )
 
         lines.append("\nCopula:")

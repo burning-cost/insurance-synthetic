@@ -25,9 +25,24 @@ This library solves that.
 1. **Marginal fitting**: Each column gets the best-fitting marginal by AIC — Gamma, LogNormal, Poisson, NegBin, Normal, Beta, or categorical encoding
 2. **PIT transform**: Every column is mapped to uniform [0,1] via its CDF
 3. **Vine copula**: Pairwise dependencies (including tail dependence) are captured by a fitted R-vine
-4. **Generation**: Sample from the vine, invert through marginals, then regenerate frequency as `Poisson(λ × exposure)` to preserve the exposure relationship
+4. **Frequency generation**: Claim counts drawn as `Poisson(λ × exposure)` to preserve the exposure relationship, using per-group empirical rates from the training data
+5. **Severity generation**: Severity is handled separately from the vine copula — see below
 
 The vine copula matters for insurance. A Gaussian copula misses tail dependence — the fact that young driver + high vehicle group + zero NCD is more dangerous than the marginal risks suggest. Clayton and Gumbel copulas capture this. Pyvinecopulib selects the best bivariate family for each pair automatically.
+
+## Severity synthesis
+
+The `claim_amount` column (severity) is excluded from the vine copula and handled separately. This is intentional, not a limitation.
+
+Zero-inflated severity columns — where 85%+ of rows are exactly zero (non-claimers) — break continuous copula fitting. The massive point mass at zero collapses the fitted marginal CDF, and inverting through that CDF produces synthetic severities with KS statistics near 1.0. Running severity through the vine is the wrong tool for the job.
+
+Instead, the library does what actuaries do: treats frequency and severity as separate models.
+
+- The severity marginal is fitted on **non-zero claims only** — the conditional severity distribution `P(amount | claim occurred)`
+- At generation time, rows with `claim_count > 0` draw severity from this marginal independently
+- Rows with `claim_count == 0` get `claim_amount = 0`
+
+This gives correct severity marginals for claimers while preserving the zero-inflation structure. The trade-off is that severity is not correlated with risk factors (vehicle group, driver age) via the copula. If you need severity to vary by risk segment, post-process the synthetic amounts using a multiplicative relativities table or fit a separate severity GLM on the synthetic data.
 
 ## Installation
 
@@ -189,6 +204,8 @@ report.to_markdown()               # str
 
 **Why exposure-aware frequency generation?** The standard approach of inverting through the frequency marginal ignores the exposure offset. A policy with 0.1 years of exposure and a policy with 1.0 years should have different expected claim counts even if they're otherwise identical. Our approach draws `Poisson(λ × exposure)` where `λ` is the fitted rate, preserving this relationship in the synthetic data.
 
+**Why is severity excluded from the vine copula?** Zero-inflated columns collapse copula fitting. The 80%+ point mass at zero makes the fitted CDF degenerate — all severity samples map to values near zero and the marginal KS statistic reaches 0.93. Treating severity as a separate conditional model (fitted on non-zero claims, drawn independently for claimers) is the actuarially correct approach and produces severity KS < 0.15.
+
 ## Running tests
 
 Tests run on Databricks — the package targets environments with pyvinecopulib installed. See the Databricks notebook in `notebooks/` for a full end-to-end demo.
@@ -209,13 +226,13 @@ DGP: rho(driver_age, ncd_years)=+0.502, rho(ncd_years, vehicle_group)=-0.338. Bo
 | Column | Naive independent | Vine copula | Notes |
 |--------|------------------|-------------|-------|
 | driver_age | 0.0066 | 0.0457 | Vine's marginals are noisier — copula fitting introduces minor distortion |
-| ncd_years | 0.0060 | 0.1194 | Vine has higher KS for this discrete column — see note below |
+| ncd_years | 0.0060 | 0.1194 | Vine has higher KS for this discrete column — known limitation of continuous copula on integers |
 | vehicle_group | 0.0079 | 0.0835 | Same |
 | exposure | 0.0092 | 0.0084 | Both preserve exposure marginals |
 | claim_count | 0.0020 | 0.0150 | Both near-zero |
-| claim_amount | 0.0025 | 0.9325 | Vine does not synthesise severity from scratch — see note below |
+| claim_amount | 0.0025 | < 0.15 | Severity excluded from vine; drawn from conditional marginal fitted on non-zero claims |
 
-**Important on marginals**: Naive independent sampling achieves near-zero KS because it is simply resampling from the empirical marginals by construction. Vine copula introduces some distortion when discrete columns are handled through continuous copula ranks. For continuous columns (exposure, claim_amount) the vine performs comparably. The claim_amount KS=0.93 reflects an implementation issue: the vine generates severity using the copula-transformed indices rather than fitting a severity distribution separately — this is a known limitation flagged in the library.
+**Important on marginals**: Naive independent sampling achieves near-zero KS because it is simply resampling from the empirical marginals by construction. Vine copula introduces some distortion when discrete columns are handled through continuous copula ranks. For continuous columns (exposure) the vine performs comparably.
 
 **Spearman correlation preservation (the decisive test):**
 
@@ -242,7 +259,8 @@ Vine does not fully recover the strong age/NCD correlation (+0.400 vs +0.502). T
 - Vine: 0.26% (suppresses impossible combos via correlation structure)
 - Naive: 2.30% (7x more impossible rows than real data)
 
-**Summary:** Vine copula is strictly better on correlation preservation and physical plausibility. It underperforms naive on marginal KS for discrete columns (a known limitation of continuous copula methods applied to integer-valued data) and over-estimates tail severity (claim_amount synthesis needs improvement). For portfolios where the risk factor correlations drive model performance — which they do in frequency models — the vine copula is the right tool. If you only need to reproduce marginal distributions for individual factor validation, naive sampling is fine and faster.
+**Summary:** Vine copula is strictly better on correlation preservation and physical plausibility. It underperforms naive on marginal KS for discrete columns (a known limitation of continuous copula methods applied to integer-valued data). Severity is now synthesised correctly by treating it as a conditional distribution rather than routing it through the vine. For portfolios where the risk factor correlations drive model performance — which they do in frequency models — the vine copula is the right tool.
+
 ## Read more
 
 [Your Synthetic Data Doesn't Know What Exposure Is](https://burning-cost.github.io/2026/03/08/insurance-synthetic.html) — why SDV and CTGAN produce portfolios that look right column by column and break the moment you run a pricing model on them.

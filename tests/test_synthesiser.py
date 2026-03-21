@@ -10,6 +10,7 @@ Covers:
 - Missing exposure column handling
 - Gaussian fallback mode
 - Summary output
+- Severity synthesis (excluded from vine, drawn from conditional marginal)
 """
 
 import numpy as np
@@ -322,3 +323,183 @@ class TestSummary:
         assert params["method"] == "gaussian"
         assert params["trunc_lvl"] == 3
         assert params["n_threads"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Severity synthesis (P0-5: excluded from vine, drawn from conditional marginal)
+# ---------------------------------------------------------------------------
+
+class TestSeveritySynthesis:
+    """
+    Tests for the fix to severity synthesis (claim_amount KS=0.93 bug).
+
+    The root cause: zero-inflated severity columns break vine copula fitting.
+    ~88% of rows are exactly 0 (non-claimers). When fitted as a continuous
+    column, the CDF collapses around zero and the PPF inversion produces
+    garbage. Fix: exclude severity from the vine, fit marginal on non-zero
+    claims only, and draw severity conditioned on claim_count > 0.
+    """
+
+    def _make_severity_df(self, rng: np.random.Generator, n: int = 500) -> pl.DataFrame:
+        """Portfolio with zero-inflated severity (roughly 85% zeros)."""
+        claim_count = rng.poisson(0.1, size=n).astype(int)
+        sev_mean = 3000.0
+        claim_amount = np.where(
+            claim_count > 0,
+            np.maximum(0.0, rng.lognormal(np.log(sev_mean), 0.8, size=n)),
+            0.0,
+        )
+        return pl.DataFrame({
+            "driver_age": rng.integers(17, 75, size=n).tolist(),
+            "ncd_years": rng.integers(0, 20, size=n).tolist(),
+            "exposure": rng.uniform(0.1, 1.0, size=n).tolist(),
+            "claim_count": claim_count.tolist(),
+            "claim_amount": claim_amount.tolist(),
+        })
+
+    def test_severity_col_excluded_from_vine_columns(self):
+        """After fit(), severity column should not be in _columns (vine columns)."""
+        rng = np.random.default_rng(0)
+        df = self._make_severity_df(rng)
+        synth = InsuranceSynthesizer(method="gaussian", random_state=0)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count")
+        assert "claim_amount" not in synth._columns, (
+            "claim_amount should be excluded from vine copula columns"
+        )
+
+    def test_severity_marginal_fitted_on_nonzero_only(self):
+        """_severity_marginal should be fitted and have positive mean."""
+        rng = np.random.default_rng(1)
+        df = self._make_severity_df(rng, n=500)
+        synth = InsuranceSynthesizer(method="gaussian", random_state=1)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count")
+        assert synth._severity_marginal is not None, (
+            "Severity marginal should be fitted on non-zero claims"
+        )
+        # Draw some samples — they should all be positive
+        samples = synth._severity_marginal.ppf(np.array([0.1, 0.5, 0.9]))
+        assert (samples > 0).all(), "Severity samples should be positive"
+
+    def test_non_claimers_have_zero_severity(self):
+        """Rows with claim_count == 0 must have claim_amount == 0."""
+        rng = np.random.default_rng(2)
+        df = self._make_severity_df(rng, n=600)
+        synth = InsuranceSynthesizer(method="gaussian", random_state=2)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count",
+                  exposure_col="exposure")
+        out = synth.generate(300)
+        non_claimers = out.filter(pl.col("claim_count") == 0)
+        assert (non_claimers["claim_amount"] == 0.0).all(), (
+            "Rows with claim_count=0 should have claim_amount=0"
+        )
+
+    def test_claimers_have_positive_severity(self):
+        """Rows with claim_count > 0 should have claim_amount > 0."""
+        rng = np.random.default_rng(3)
+        # Use higher frequency to ensure enough claimers
+        n = 800
+        claim_count = rng.poisson(0.3, size=n).astype(int)
+        sev_mean = 2500.0
+        claim_amount = np.where(
+            claim_count > 0,
+            np.maximum(1.0, rng.lognormal(np.log(sev_mean), 0.7, size=n)),
+            0.0,
+        )
+        df = pl.DataFrame({
+            "driver_age": rng.integers(17, 75, size=n).tolist(),
+            "exposure": rng.uniform(0.1, 1.0, size=n).tolist(),
+            "claim_count": claim_count.tolist(),
+            "claim_amount": claim_amount.tolist(),
+        })
+        synth = InsuranceSynthesizer(method="gaussian", random_state=3)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count",
+                  exposure_col="exposure")
+        out = synth.generate(500)
+        claimers = out.filter(pl.col("claim_count") > 0)
+        if len(claimers) > 0:
+            assert (claimers["claim_amount"] > 0).all(), (
+                "Rows with claim_count>0 should have positive claim_amount"
+            )
+
+    def test_severity_ks_is_reasonable(self):
+        """
+        Severity KS statistic should be substantially below 0.5 after the fix.
+        The pre-fix KS was 0.93 — this test guards against regression.
+
+        We test KS on non-zero claim amounts (comparing only the severity
+        distribution, not the zero-inflation), which is what the fix targets.
+        """
+        from scipy.stats import ks_2samp
+
+        rng = np.random.default_rng(42)
+        n = 800
+        claim_count = rng.poisson(0.15, size=n).astype(int)
+        sev_mean = 3000.0
+        claim_amount = np.where(
+            claim_count > 0,
+            np.maximum(0.1, rng.lognormal(np.log(sev_mean), 0.8, size=n)),
+            0.0,
+        )
+        df = pl.DataFrame({
+            "driver_age": rng.integers(17, 75, size=n).tolist(),
+            "exposure": rng.uniform(0.1, 1.0, size=n).tolist(),
+            "claim_count": claim_count.tolist(),
+            "claim_amount": claim_amount.tolist(),
+        })
+
+        synth = InsuranceSynthesizer(method="gaussian", random_state=42)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count",
+                  exposure_col="exposure")
+        out = synth.generate(800)
+
+        real_nonzero = claim_amount[claim_amount > 0]
+        synth_nonzero = out.filter(pl.col("claim_amount") > 0)["claim_amount"].to_numpy()
+
+        if len(synth_nonzero) >= 10 and len(real_nonzero) >= 10:
+            ks_stat, _ = ks_2samp(real_nonzero, synth_nonzero)
+            assert ks_stat < 0.5, (
+                f"Severity KS statistic = {ks_stat:.3f}. "
+                "Should be < 0.5 after fix. If near 0.93, regression to pre-fix behavior."
+            )
+
+    def test_severity_column_present_in_output(self):
+        """Output DataFrame should include the severity column."""
+        rng = np.random.default_rng(5)
+        df = self._make_severity_df(rng)
+        synth = InsuranceSynthesizer(method="gaussian", random_state=5)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count")
+        out = synth.generate(100)
+        assert "claim_amount" in out.columns
+
+    def test_output_column_order_matches_input(self):
+        """Output columns should be in the same order as input."""
+        rng = np.random.default_rng(6)
+        df = self._make_severity_df(rng)
+        synth = InsuranceSynthesizer(method="gaussian", random_state=6)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count")
+        out = synth.generate(100)
+        assert out.columns == df.columns, (
+            f"Column order mismatch: input={df.columns}, output={out.columns}"
+        )
+
+    def test_no_severity_col_still_works(self, medium_motor_df):
+        """If severity_col is not specified, generation should work as before."""
+        synth = InsuranceSynthesizer(method="gaussian", random_state=42)
+        synth.fit(medium_motor_df, severity_col=None)
+        out = synth.generate(100)
+        assert len(out) == 100
+        assert set(out.columns) == set(medium_motor_df.columns)
+
+    def test_summary_mentions_severity_exclusion(self):
+        """Summary should note that severity is excluded from vine copula."""
+        rng = np.random.default_rng(7)
+        df = self._make_severity_df(rng)
+        synth = InsuranceSynthesizer(method="gaussian", random_state=7)
+        synth.fit(df, severity_col="claim_amount", frequency_col="claim_count")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s = synth.summary()
+        assert "copula-excluded" in s.lower() or "excluded from vine" in s.lower(), (
+            "Summary should mention that severity is excluded from the vine copula"
+        )
