@@ -7,7 +7,7 @@ name = "insurance-synthetic"
 version = "0.1.4"
 description = "Vine copula synthetic insurance portfolio data generator"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
     { name = "Burning Cost", email = "pricing.frontier@gmail.com" }
 ]
