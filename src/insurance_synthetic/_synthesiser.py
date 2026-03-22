@@ -356,6 +356,11 @@ class InsuranceSynthesizer:
         """
         if not self._is_fitted:
             raise RuntimeError("Call fit() before generate().")
+        if n <= 0:
+            raise ValueError(
+                f"n must be a positive integer, got {n}. "
+                "generate() requires at least 1 sample."
+            )
 
         # Generate slightly more than needed in case constraints remove some rows
         oversample = max(n, int(n * 1.2))
