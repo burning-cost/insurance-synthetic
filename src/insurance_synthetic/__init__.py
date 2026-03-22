@@ -51,4 +51,9 @@ __all__ = [
     "ColumnSpec",
 ]
 
-__version__ = "0.1.4"
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("insurance-synthetic")
+except PackageNotFoundError:
+    __version__ = "0.0.0"  # not installed
