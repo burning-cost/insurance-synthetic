@@ -92,7 +92,7 @@ class SyntheticFidelityReport:
             synth_col = self.synthetic_df[col]
 
             # Skip non-numeric columns for KS/Wasserstein
-            if real_col.dtype in (pl.Utf8, pl.Categorical, pl.String):
+            if real_col.dtype in (pl.String, pl.Categorical, pl.String):
                 rows.append({
                     "column": col,
                     "ks_statistic": None,
@@ -157,7 +157,7 @@ class SyntheticFidelityReport:
         numeric_cols = [
             c for c in self.real_df.columns
             if c in self.synthetic_df.columns
-            and self.real_df[c].dtype not in (pl.Utf8, pl.Categorical, pl.String)
+            and self.real_df[c].dtype not in (pl.String, pl.Categorical, pl.String)
         ]
 
         n_cols = len(numeric_cols)
@@ -334,7 +334,7 @@ class SyntheticFidelityReport:
         ]
         cat_features = [
             c for c in feature_cols
-            if self.real_df[c].dtype in (pl.Utf8, pl.Categorical, pl.String)
+            if self.real_df[c].dtype in (pl.String, pl.Categorical, pl.String)
         ]
 
         # Detect whether the target is count/integer (use Poisson loss) or

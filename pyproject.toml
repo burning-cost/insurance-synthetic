@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "insurance-synthetic"
-version = "0.1.6"
+version = "0.1.7"
 description = "Vine copula synthetic insurance portfolio data generator"
 readme = "README.md"
 license = "MIT"

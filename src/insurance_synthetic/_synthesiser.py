@@ -191,7 +191,7 @@ class InsuranceSynthesizer:
 
         # Auto-detect string columns as categorical
         for col in df.columns:
-            if df[col].dtype in (pl.Utf8, pl.Categorical, pl.String):
+            if df[col].dtype in (pl.String, pl.Categorical, pl.String):
                 self._categorical_cols.add(col)
 
         force_discrete = set(discrete_cols or [])
@@ -484,7 +484,7 @@ class InsuranceSynthesizer:
         for col, vals in data.items():
             marginal = self._fitted_marginals[col]
             if marginal.kind == "categorical":
-                series_list.append(pl.Series(name=col, values=vals, dtype=pl.Utf8))
+                series_list.append(pl.Series(name=col, values=vals, dtype=pl.String))
             elif marginal.kind == "discrete":
                 series_list.append(pl.Series(name=col, values=vals, dtype=pl.Int64))
             else:

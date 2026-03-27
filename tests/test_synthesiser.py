@@ -98,7 +98,7 @@ class TestOutputTypes:
         synth.fit(small_motor_df)
         out = synth.generate(50)
         if "region" in out.columns:
-            assert out["region"].dtype in (pl.Utf8, pl.String)
+            assert out["region"].dtype in (pl.String, pl.String)
 
     def test_categorical_values_valid(self, small_motor_df):
         """Synthetic region values should come from the original set."""
@@ -241,7 +241,7 @@ class TestReproducibility:
         any_differ = any(
             not np.array_equal(out1[col].to_numpy(), out2[col].to_numpy())
             for col in out1.columns
-            if out1[col].dtype not in (pl.Utf8, pl.String)
+            if out1[col].dtype not in (pl.String, pl.String)
         )
         assert any_differ, "Different seeds produced identical numeric output"
 

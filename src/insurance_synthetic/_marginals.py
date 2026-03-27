@@ -367,7 +367,7 @@ def fit_marginal(
     data = series.drop_nulls()
 
     # --- Categorical handling ---
-    if is_categorical or data.dtype == pl.Utf8 or data.dtype == pl.Categorical:
+    if is_categorical or data.dtype == pl.String or data.dtype == pl.Categorical:
         counts = data.value_counts(sort=True)
         # polars value_counts column name is the series name
         cat_col = col_name if col_name in counts.columns else counts.columns[0]
