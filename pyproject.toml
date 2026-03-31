@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "insurance-synthetic"
 version = "0.1.7"
-description = "Vine copula synthetic insurance portfolio data generator"
+description = "Vine copula synthetic insurance portfolio data generator with optional differential privacy"
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -21,6 +21,7 @@ keywords = [
     "motor",
     "UK",
     "personal lines",
+    "differential-privacy",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -47,6 +48,9 @@ vine = [
 ]
 fidelity = [
     "catboost>=1.0",
+]
+dp = [
+    "smartnoise-synth>=1.0",
 ]
 dev = [
     "pytest>=7.0",
