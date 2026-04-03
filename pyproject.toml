@@ -51,10 +51,12 @@ fidelity = [
 ]
 dp = [
     "smartnoise-synth>=1.0",
+    "pandas>=1.5",
 ]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+    "pandas>=1.5",
 ]
 
 [project.urls]
